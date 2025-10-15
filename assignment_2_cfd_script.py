@@ -455,8 +455,8 @@ lvm_cfd = AR_LVM_Model(
 
 loss = ELBO_Loss(L=20.0, beta=0.0)  # will warm up to 1.0
 p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader,
-            batch_size=batch_size, lr=1e-4, epochs=300, loss_fn=loss,
-            model_name="02-LV-TB.pt", kl_warmup_epochs=30, teacher_forcing=True, tf_ratio=1.0)
+            batch_size=batch_size, lr=1e-4, epochs=100, loss_fn=loss,
+            model_name="02-LV-TB.pt", kl_warmup_epochs=30, teacher_forcing=True, tf_ratio=0.5)
 p.train_loop()
 
 # # After computing train_files/val_files, compute normalization stats on train:
