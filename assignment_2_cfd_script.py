@@ -109,7 +109,7 @@ val_files   = [datafolder / f for f in ['uvp_grid_Re150.npy','uvp_grid_Re250.npy
 train_files = list(map(str, train_files))
 val_files   = list(map(str, val_files))
 
-dt = 20 # only sample every dt timesteps
+dt = 10 # only sample every dt timesteps
 batch_size = 64
 bundle_size=6
 train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, bundle_size=bundle_size)
@@ -455,28 +455,28 @@ lvm_cfd = AR_LVM_Model(
 
 loss = ELBO_Loss(L=20.0, beta=0.0)  # will warm up to 1.0
 p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader,
-            batch_size=batch_size, lr=1e-4, epochs=200, loss_fn=loss,
+            batch_size=batch_size, lr=1e-4, epochs=300, loss_fn=loss,
             model_name="02-LV-TB.pt", kl_warmup_epochs=30, teacher_forcing=True, tf_ratio=1.0)
 p.train_loop()
 
-# After computing train_files/val_files, compute normalization stats on train:
-def _compute_uvp_stats(files, timesample):
-    ms = []
-    vs = []
-    for f in files:
-        x = np.load(f)[::timesample].astype(np.float32)  # (T,3,H,W)
-        ms.append(x.mean(axis=(0,2,3)))
-        vs.append(x.var(axis=(0,2,3)))
-    mean = np.mean(ms, axis=0)
-    std = np.sqrt(np.mean(vs, axis=0))
-    std = np.maximum(std, 1e-6)
-    return mean, std
+# # After computing train_files/val_files, compute normalization stats on train:
+# def _compute_uvp_stats(files, timesample):
+#     ms = []
+#     vs = []
+#     for f in files:
+#         x = np.load(f)[::timesample].astype(np.float32)  # (T,3,H,W)
+#         ms.append(x.mean(axis=(0,2,3)))
+#         vs.append(x.var(axis=(0,2,3)))
+#     mean = np.mean(ms, axis=0)
+#     std = np.sqrt(np.mean(vs, axis=0))
+#     std = np.maximum(std, 1e-6)
+#     return mean, std
 
-train_mean, train_std = _compute_uvp_stats(train_files, dt)
+# train_mean, train_std = _compute_uvp_stats(train_files, dt)
 
-train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, bundle_size=bundle_size,
-                            norm_mean=train_mean, norm_std=train_std)
-val_dataset   = FlowDataset(val_files,   flip_augmentation=False, timesample=dt, bundle_size=bundle_size,
-                            norm_mean=train_mean, norm_std=train_std)
+# train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, bundle_size=bundle_size,
+#                             norm_mean=train_mean, norm_std=train_std)
+# val_dataset   = FlowDataset(val_files,   flip_augmentation=False, timesample=dt, bundle_size=bundle_size,
+#                             norm_mean=train_mean, norm_std=train_std)
 
 
