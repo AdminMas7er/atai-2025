@@ -48,7 +48,7 @@ for Re in [100, 150, 200, 250, 300, 350, 400]:
 
 
 class FlowDataset(Dataset):
-    def __init__(self, filenames, flip_augmentation=False, timesample=1, use_coords=True, norm_mean=None, norm_std=None):
+    def __init__(self, filenames, flip_augmentation=False, timesample=1, use_coords=True):
         
         
         self.sequences = []
@@ -68,8 +68,6 @@ class FlowDataset(Dataset):
         squared_distance = ((self.coords - center) ** 2).sum(dim=0) 
         self.mask = squared_distance < radius**2  # shape [64, 128]
         self.mask = self.mask.unsqueeze(0).float()
-        self.norm_mean = None if norm_mean is None else torch.tensor(norm_mean, dtype=torch.float32)
-        self.norm_std  = None if norm_std  is None else torch.tensor(norm_std,  dtype=torch.float32)
 
         # sample/read the data
         for seq_idx, filename in enumerate(filenames):
@@ -95,11 +93,6 @@ class FlowDataset(Dataset):
         target_tensor = torch.tensor(target_frame, dtype=torch.float32)
         if self.use_coords:
             input_tensor=torch.cat([input_tensor, self.coords], axis=0)
-        if self.norm_mean is not None:
-            m = self.norm_mean[:, None, None]
-            s = self.norm_std[:, None, None].clamp_min(1e-6)
-            input_tensor[:3] = (input_tensor[:3] - m) / s
-            target_tensor = (target_tensor - m) / s
 
         return (self.mask, input_tensor, target_tensor)
         
@@ -125,26 +118,15 @@ val_files = [datafolder / f for f in [
     'uvp_grid_Re150.npy', 'uvp_grid_Re250.npy', 'uvp_grid_Re350.npy'
 ]]
 
-def _compute_uvp_stats(files, timesample=1):
-    ms, vs = [], []
-    for f in files:
-        x = np.load(f)[::timesample].astype(np.float32)  # (T,3,H,W)
-        ms.append(x.mean(axis=(0, 2, 3)))
-        vs.append(x.var(axis=(0, 2, 3)))
-    mean = np.mean(ms, axis=0)
-    std = np.sqrt(np.mean(vs, axis=0))
-    std = np.maximum(std, 1e-6)
-    return mean, std
 
-
-dt = 10 # only sample every dt timesteps
-train_mean, train_std = _compute_uvp_stats([str(p) for p in train_files], timesample=dt)
+dt = 2 # only sample every dt timesteps
+pin=torch.cuda.is_available()
 batch_size = 64
 use_coordinates=True
-train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates, norm_mean=train_mean, norm_std=train_std)
-val_dataset = FlowDataset(val_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates, norm_mean=train_mean, norm_std=train_std)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,num_workers=4)
+train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates)
+val_dataset = FlowDataset(val_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,num_workers=4, pin_memory=pin)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,num_workers=4, pin_memory=pin)
 
 
 class ELBO_Loss(torch.nn.Module):
@@ -446,7 +428,7 @@ class Trainer:
                loss = self.loss_fn(y_pred, x_next)
                loss.backward()
                self.optimizer.step()
-               mean_train_loss += loss.item() # Also fix the training loss calculation
+               mean_train_loss += loss.item()
             mean_train_loss /= len(self.train_loader)
 
             # Validate the model
@@ -458,8 +440,8 @@ class Trainer:
                     mask = mask.to(self.device)
                     x_t = x_t.to(self.device)
                     x_next = x_next.to(self.device)
-                    out = self.model(x_t, x_next, mask)  # FIX: Correct the argument order
-                    loss = self.loss_fn(out, x_next,mask)
+                    out = self.model(x_t, x_next, mask)  
+                    loss = self.loss_fn(out, x_next, mask)
                     mean_val_loss += loss.item()
                 mean_val_loss /= len(self.validation_loader)
 
@@ -471,16 +453,16 @@ class Trainer:
 
 
 input_dim=6 if use_coordinates else 4
-processor=Processor(num_layers=4, in_dim=input_dim, emb_dim=64, nonlinearity=torch.nn.functional.relu)
+processor=Processor(num_layers=4, in_dim=input_dim, emb_dim=128, nonlinearity=torch.nn.functional.relu)
 lvm_cfd=AR_LVM_Model(
-    encoder=Encoder(num_layers=2, emb_dim=64, latent_dim=16, nonlinearity=torch.nn.functional.relu),
+    encoder=Encoder(num_layers=3, emb_dim=128, latent_dim=32, nonlinearity=torch.nn.functional.relu),
     processor=processor,
-    decoder=Decoder(num_layers=2, latent_dim=16, emb_dim=64, out_dim=3, nonlinearity=torch.nn.functional.relu, sigma=0.1),
-    prior=Prior(num_layers=2, emb_dim=64, latent_dim=16, nonlinearity=torch.nn.functional.relu),
+    decoder=Decoder(num_layers=3, latent_dim=32, emb_dim=128, out_dim=3, nonlinearity=torch.nn.functional.relu, sigma=0.1),
+    prior=Prior(num_layers=3, emb_dim=128, latent_dim=32, nonlinearity=torch.nn.functional.relu),
     use_coordinates=use_coordinates
 )
-loss=ELBO_Loss(L=20.0)
-p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader, batch_size=batch_size, lr=0.0001, epochs=200, loss_fn=loss, model_name="02-LV-FBF-1.pt")
+loss=ELBO_Loss(L=20.0,beta=1.0)
+p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader, batch_size=batch_size, lr=0.0001, epochs=150, loss_fn=loss, model_name="02-LV-FBF-3.pt")
 p.train_loop()
 
 
