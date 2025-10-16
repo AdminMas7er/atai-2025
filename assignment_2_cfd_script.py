@@ -1,10 +1,18 @@
-import torch
+
+# # Assignment 2 for 2AMM40
+
+
+import torch 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 import os
-import subprocess
+from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
+import subprocess
+
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from matplotlib import animation
 
@@ -14,35 +22,38 @@ plt.rcParams['figure.facecolor'] = '#1E1E1E'
 plt.rcParams['axes.facecolor'] = '#1E1E1E'
 plt.rcParams['savefig.facecolor'] = '#1E1E1E'
 
-# ---------------- MIG-safe detection (don’t crash if nvidia-smi missing) ----------------
-try:
-    out = subprocess.check_output(["nvidia-smi", "-L"], text=True)
-    if "MIG" in out:
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-except Exception:
-    pass
 
-# ---------------- Robust paths relative to this script ----------------
+
+
+################# quickfix for Snellius GPU MIG usage
+import os 
+import subprocess
+if "MIG" in subprocess.check_output(["nvidia-smi", "-L"], text=True):
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+# this box fuses the loose data files such that they can be read by the dataset object
 PROJECT_ROOT = Path(__file__).resolve().parent
-base_in = PROJECT_ROOT / "data" / "CFD" / "grid" / "loose"
-base_out2 = PROJECT_ROOT / "data" / "CFD" / "grid" / "concat"
-os.makedirs(base_out2, exist_ok=True)
-for Re in [100,150,200,250,300,350,400]:
+DATA_ROOT = PROJECT_ROOT / "data" / "CFD" / "grid"
+base_in = DATA_ROOT / "loose"
+base_out2 = DATA_ROOT / "concat"
+base_out2.mkdir(parents=True, exist_ok=True)
+# Fuse loose files -> concat
+for Re in [100, 150, 200, 250, 300, 350, 400]:
     u = np.load(base_in / f"u_grid_Re{Re}.npy")
     v = np.load(base_in / f"v_grid_Re{Re}.npy")
     p = np.load(base_in / f"p_grid_Re{Re}.npy")
     concat = np.stack([u, v, p], axis=1)
-    filename_save = base_out2 / f"uvp_grid_Re{Re}.npy"
-    np.save(filename_save, concat)
+    np.save(base_out2 / f"uvp_grid_Re{Re}.npy", concat)
 
 
 class FlowDataset(Dataset):
-    def __init__(self, filenames, flip_augmentation=False, timesample=1, bundle_size=6,
-                 norm_mean=None, norm_std=None):
+    def __init__(self, filenames, flip_augmentation=False, timesample=1, use_coords=True):
+        
         self.sequences = []
         self.index_map = []
         self.flip_augmentation = flip_augmentation
-        self.bundle_size = bundle_size
+        self.use_coords = use_coords
 
         # coordinates
         self.coordsy = np.linspace(-5, 5, 64, endpoint=True)
@@ -63,10 +74,7 @@ class FlowDataset(Dataset):
             data = data[::timesample] 
             self.sequences.append(data)
             T = data.shape[0]
-            self.index_map.extend([(seq_idx, t) for t in range(T - self.bundle_size)])
-
-        self.norm_mean = None if norm_mean is None else torch.tensor(norm_mean, dtype=torch.float32)
-        self.norm_std  = None if norm_std  is None else torch.tensor(norm_std,  dtype=torch.float32)
+            self.index_map.extend([(seq_idx, t) for t in range(T - 1)])
 
     def __len__(self):
         return len(self.index_map)
@@ -74,20 +82,20 @@ class FlowDataset(Dataset):
     def __getitem__(self, idx):
         seq_idx, t = self.index_map[idx]
         seq = self.sequences[seq_idx]
-        input = seq[t]
-        target_bundle = seq[t+1:t+1+self.bundle_size]
+        input = seq[t]    
+        target_frame=seq[t + 1]
         # if flip augmentation is true then flip the data horizontally 50% of the time
         if self.flip_augmentation and np.random.rand() > 0.5:
             input = self.flip(input)
-            target_bundle = np.stack([self.flip(f) for f in target_bundle], axis=0)
-        input = torch.tensor(input, dtype=torch.float32)
-        target_bundle = torch.tensor(target_bundle, dtype=torch.float32)
-        if self.norm_mean is not None:
-            m = self.norm_mean[:, None, None]
-            s = self.norm_std[:, None, None].clamp_min(1e-6)
-            input = (input - m) / s
-            target_bundle = (target_bundle - m) / s
-        return (self.mask, self.coords, input, target_bundle)
+            target_frame = self.flip(target_frame)
+        input_tensor=torch.tensor(input, dtype=torch.float32)
+        if self.use_coords:
+            input_tensor=torch.cat([input_tensor, self.coords], axis=0)
+        return (
+                self.mask, 
+                input_tensor, 
+                torch.tensor(target_frame, dtype=torch.float32)
+                )
         
     def get_trajectory(self, seq_idx):
         # returns full trajectory
@@ -104,32 +112,59 @@ class FlowDataset(Dataset):
         return x
 
 datafolder = base_out2
-train_files = [datafolder / f for f in ['uvp_grid_Re100.npy','uvp_grid_Re200.npy','uvp_grid_Re300.npy','uvp_grid_Re400.npy']]
-val_files   = [datafolder / f for f in ['uvp_grid_Re150.npy','uvp_grid_Re250.npy','uvp_grid_Re350.npy']]
-train_files = list(map(str, train_files))
-val_files   = list(map(str, val_files))
+train_files = [datafolder / f for f in [
+    'uvp_grid_Re100.npy', 'uvp_grid_Re200.npy', 'uvp_grid_Re300.npy', 'uvp_grid_Re400.npy'
+]]
+val_files = [datafolder / f for f in [
+    'uvp_grid_Re150.npy', 'uvp_grid_Re250.npy', 'uvp_grid_Re350.npy'
+]]
 
-dt = 10 # only sample every dt timesteps
+dt = 20 # only sample every dt timesteps
 batch_size = 64
-bundle_size=6
-train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, bundle_size=bundle_size)
-val_dataset = FlowDataset(val_files, flip_augmentation=False, timesample=dt, bundle_size=bundle_size)
+use_coordinates=True
+train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates)
+val_dataset = FlowDataset(val_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
 
 class ELBO_Loss(torch.nn.Module):
-    def __init__(self, L, beta=1.0):
+    def __init__(self, L):
+        """
+        Helper class to compute the ELBO loss for the AR-LVM model
+
+        Args:
+            L: size of the periodic boundary conditions
+        """
         super(ELBO_Loss, self).__init__()
         self.L = L
-        self.beta = beta
     
-    def forward(self, y_pred, y_true_bundle):
-        enc_dist, prior_dist, predicted_bundle = y_pred
-        # Mean over batch, channels, H, W (prevents KL from overwhelming MSE)
-        kl = torch.distributions.kl.kl_divergence(enc_dist, prior_dist).mean()
-        recon = torch.nn.functional.mse_loss(predicted_bundle, y_true_bundle, reduction='mean')
-        return self.beta * kl + recon
+    def forward(self, y_pred, y_true):
+        """
+        Forward pass of the ELBO loss.
+
+        Args:
+            y_pred: (q(z|h, x^t+1), p(z|h), p(x^t+1|z, h))
+                each is a torch.Distribution object
+            y_true: (x^t+1)
+
+        ELBO is the sum of the KL divergence between the approximate posterior and the prior
+        and the reconstruction loss
+        = KL(q(z|h, x^t+1) || p(z|h)) - E_q(z|h, x^t+1)[log p(x^t+1|z, h)]
+
+        Returns:
+            torch.Tensor: ELBO loss
+
+        """
+        enc_dist, prior_dist, predicted_frame = y_pred
+        
+        # KL divergence is calculated once per sequence
+        kl = torch.distributions.kl.kl_divergence(enc_dist, prior_dist).mean(0).sum()
+        
+        # Reconstruction loss is the MSE over the entire predicted sequence
+        recon = torch.nn.functional.mse_loss(predicted_frame, y_true, reduction='mean')
+
+        return kl + recon
         
 
 class Encoder(torch.nn.Module):
@@ -303,65 +338,60 @@ class Prior(torch.nn.Module):
 
 
 class AR_LVM_Model(torch.nn.Module):
-    def __init__(self, encoder=None, processor=None, decoder=None, prior=None, use_mask=True, use_coords=False,
-                 predict_residual=True):
+    def __init__(self, encoder=None, processor=None, decoder=None, prior=None,use_coordinates=False):
+        
         super(AR_LVM_Model, self).__init__()
         self.encoder = encoder
         self.processor = processor
         self.decoder = decoder
         self.prior = prior
-        self.use_mask = use_mask
-        self.use_coords = use_coords
-        self.predict_residual = predict_residual
+        self.use_coordinates=use_coordinates
 
-    def _make_input(self, x, mask, coords):
-        feats = [x]
-        if self.use_mask:
-            feats.append(mask)     # (1, H, W)
-        if self.use_coords:
-            feats.append(coords)   # (2, H, W)
-        return torch.cat(feats, dim=1)
-
-    def forward(self, x_t, target_bundle, mask, coords, teacher_forcing=False):
+    def forward(self, x_t, x_next, mask):
         """
         Forward pass of the AR-LVM model for grid data.
         """
-        bundle_size = target_bundle.shape[1]
-        input_ar = self._make_input(x_t, mask, coords)
-        first_future = target_bundle[:, 0]
+        if self.use_coordinates and x_t.shape[1]>=5:
+            coords=x_t[:, -2:, :, :]
+            input_ar = torch.cat([x_t, mask], dim=1)
+            in_next_ar = torch.cat([x_next, mask, coords], dim=1)
+        else:
+            input_ar = torch.cat([x_t, mask], dim=1)
+            in_next_ar = torch.cat([x_next, mask], dim=1)
+
         h_t = self.processor(input_ar)
-        h_next = self.processor(self._make_input(first_future, mask, coords))
+        h_next = self.processor(in_next_ar)
+     
         enc_dist = self.encoder(h_t, h_next)
-        z_inf = enc_dist.rsample()
+
+        z_inf = enc_dist.rsample() 
+        
         prior_dist = self.prior(h_t)
 
-        generated_frames = []
-        current_x = x_t
-        for s in range(bundle_size):
-            h_step = self.processor(self._make_input(current_x, mask, coords))
-            out_dist = self.decoder(h_step, z_inf)
-            step_pred = out_dist.loc
-            current_x = current_x + step_pred if self.predict_residual else step_pred
-            generated_frames.append(current_x)
-            if teacher_forcing:
-                current_x = target_bundle[:, s]
-        predicted_bundle = torch.stack(generated_frames, dim=1)
-        return (enc_dist, prior_dist, predicted_bundle)
+        out_distance = self.decoder(h_t, z_inf)
+        predicted_frame = out_distance.loc  # Mean prediction
 
-    def sample(self, mask, coords, x_t):
+        return (enc_dist, prior_dist, predicted_frame)
+
+    def sample(self, mask, x_t):
         """
         Sample from the AR-LVM model with grid data.
         """
-        h = self.processor(self._make_input(x_t, mask, coords))
+        # The dataloader already created the batch, so we can directly concatenate.
+        processor_temp = torch.cat([x_t, mask], dim=1)
+
+        # Get the node embeddings
+        h = self.processor(processor_temp)
+        # Get the Prior distribution p(z|h)
         prior_dist = self.prior(h)
         z = prior_dist.rsample()
+        # Get the Decoder distribution p(x^t+1|z, h)
         out = self.decoder(h, z)
         return out.loc
 
 
 class Trainer:
-    def __init__(self, model, train_loader, validation_loader, batch_size=1, lr=0.0001, epochs=200, loss_fn=torch.nn.MSELoss(), model_name="02-LV-TB.pt",
-                 kl_warmup_epochs=20, teacher_forcing=False, tf_ratio=1.0):
+    def __init__(self, model, train_loader, validation_loader, batch_size=1, lr=0.0001, epochs=100, loss_fn=torch.nn.MSELoss(), model_name= "02-LV-TB.pt"):
         """
         Simple Trainer class to train a PyTorch (geometric) model on a dataset.
 
@@ -387,96 +417,64 @@ class Trainer:
         print("Using device:", self.device)
         self.model.to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        self.kl_warmup_epochs = kl_warmup_epochs
-        self.teacher_forcing = teacher_forcing
-        self.tf_ratio = tf_ratio
+
 
     def train_loop(self):
+        """
+        Train loop for the model
+        """
         best_model_loss = np.inf
         for epoch in range(self.epochs):
-            # KL warmup
-            if hasattr(self.loss_fn, "beta"):
-                self.loss_fn.beta = min(1.0, (epoch + 1) / max(1, self.kl_warmup_epochs))
+            # Train the model
             self.model.train()
-            mean_train_loss = 0.0
+            mean_train_loss = 0
             for i, data in enumerate(self.train_loader):
-                # Unpack all four items from the dataset
-                mask, coords, x_t, x_next_bundle = data
-                mask = mask.to(self.device)
-                coords = coords.to(self.device)
-                x_t = x_t.to(self.device)
-                x_next_bundle = x_next_bundle.to(self.device)
+               mask, x_t, x_next = data
+               mask = mask.to(self.device)
+               x_t = x_t.to(self.device)
+               x_next = x_next.to(self.device)
+               self.optimizer.zero_grad()
+               # FIX: Correct the argument order to match the model's forward method
+               y_pred = self.model(x_t, x_next, mask)
 
-                self.optimizer.zero_grad()
-                out = self.model(x_t, x_next_bundle, mask, coords,
-                                 teacher_forcing=(self.teacher_forcing and np.random.rand() < self.tf_ratio))
-                loss = self.loss_fn(out, x_next_bundle)
-                loss.backward()
-                self.optimizer.step()
-                mean_train_loss += loss.item()
+               loss = self.loss_fn(y_pred, x_next)
+               loss.backward()
+               self.optimizer.step()
+               mean_train_loss += loss.item() # Also fix the training loss calculation
             mean_train_loss /= len(self.train_loader)
 
+            # Validate the model
             self.model.eval()
-            mean_val_loss = 0.0
+            mean_val_loss = 0
             with torch.no_grad():
                 for i, data in enumerate(self.validation_loader):
-                    mask, coords, x_t, x_next_bundle = data
+                    mask, x_t, x_next = data
                     mask = mask.to(self.device)
-                    coords = coords.to(self.device)
                     x_t = x_t.to(self.device)
-                    x_next_bundle = x_next_bundle.to(self.device)
-                    out = self.model(x_t, x_next_bundle, mask, coords)
-                    loss = self.loss_fn(out, x_next_bundle)
+                    x_next = x_next.to(self.device)
+                    out = self.model(x_t, x_next, mask)  # FIX: Correct the argument order
+                    loss = self.loss_fn(out, x_next)
                     mean_val_loss += loss.item()
-            mean_val_loss /= len(self.validation_loader)
+                mean_val_loss /= len(self.validation_loader)
 
             if mean_val_loss < best_model_loss:
                 best_model_loss = mean_val_loss
-                save_dir = PROJECT_ROOT / "models" / "CFD"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(self.model.state_dict(), save_dir / self.model_name)
+                torch.save(self.model.state_dict(), f"{self.model_name}")
 
             print(f"Epoch {epoch}, Mean Train Loss: {mean_train_loss}, Mean Validation Loss: {mean_val_loss}")
 
 
-# Toggles and correct in_dim for Processor
-use_mask = True
-use_coords = True  # enable positional info
-in_dim = 3 + (1 if use_mask else 0) + (2 if use_coords else 0)
-
-processor = Processor(num_layers=4, in_dim=in_dim, emb_dim=64, nonlinearity=torch.nn.functional.relu)
-lvm_cfd = AR_LVM_Model(
+input_dim=6 if use_coordinates else 4
+processor=Processor(num_layers=4, in_dim=input_dim, emb_dim=64, nonlinearity=torch.nn.functional.relu)
+lvm_cfd=AR_LVM_Model(
     encoder=Encoder(num_layers=2, emb_dim=64, latent_dim=16, nonlinearity=torch.nn.functional.relu),
     processor=processor,
     decoder=Decoder(num_layers=2, latent_dim=16, emb_dim=64, out_dim=3, nonlinearity=torch.nn.functional.relu, sigma=0.1),
     prior=Prior(num_layers=2, emb_dim=64, latent_dim=16, nonlinearity=torch.nn.functional.relu),
-    use_mask=use_mask, use_coords=use_coords, predict_residual=True,
+    use_coordinates=use_coordinates
 )
-
-loss = ELBO_Loss(L=20.0, beta=0.0)  # will warm up to 1.0
-p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader,
-            batch_size=batch_size, lr=1e-4, epochs=100, loss_fn=loss,
-            model_name="02-LV-TB.pt", kl_warmup_epochs=30, teacher_forcing=True, tf_ratio=0.5)
+loss=ELBO_Loss(L=20.0)
+p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader, batch_size=batch_size, lr=0.0001, epochs=100, loss_fn=loss, model_name="02-LV-FBF.pt")
 p.train_loop()
-
-# # After computing train_files/val_files, compute normalization stats on train:
-# def _compute_uvp_stats(files, timesample):
-#     ms = []
-#     vs = []
-#     for f in files:
-#         x = np.load(f)[::timesample].astype(np.float32)  # (T,3,H,W)
-#         ms.append(x.mean(axis=(0,2,3)))
-#         vs.append(x.var(axis=(0,2,3)))
-#     mean = np.mean(ms, axis=0)
-#     std = np.sqrt(np.mean(vs, axis=0))
-#     std = np.maximum(std, 1e-6)
-#     return mean, std
-
-# train_mean, train_std = _compute_uvp_stats(train_files, dt)
-
-# train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, bundle_size=bundle_size,
-#                             norm_mean=train_mean, norm_std=train_std)
-# val_dataset   = FlowDataset(val_files,   flip_augmentation=False, timesample=dt, bundle_size=bundle_size,
-#                             norm_mean=train_mean, norm_std=train_std)
 
 
