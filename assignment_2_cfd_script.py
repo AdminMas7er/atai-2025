@@ -48,7 +48,8 @@ for Re in [100, 150, 200, 250, 300, 350, 400]:
 
 
 class FlowDataset(Dataset):
-    def __init__(self, filenames, flip_augmentation=False, timesample=1, use_coords=True):
+    def __init__(self, filenames, flip_augmentation=False, timesample=1, use_coords=True, norm_mean=None, norm_std=None):
+        
         
         self.sequences = []
         self.index_map = []
@@ -67,6 +68,8 @@ class FlowDataset(Dataset):
         squared_distance = ((self.coords - center) ** 2).sum(dim=0) 
         self.mask = squared_distance < radius**2  # shape [64, 128]
         self.mask = self.mask.unsqueeze(0).float()
+        self.norm_mean = None if norm_mean is None else torch.tensor(norm_mean, dtype=torch.float32)
+        self.norm_std  = None if norm_std  is None else torch.tensor(norm_std,  dtype=torch.float32)
 
         # sample/read the data
         for seq_idx, filename in enumerate(filenames):
@@ -89,13 +92,16 @@ class FlowDataset(Dataset):
             input = self.flip(input)
             target_frame = self.flip(target_frame)
         input_tensor=torch.tensor(input, dtype=torch.float32)
+        target_tensor = torch.tensor(target_frame, dtype=torch.float32)
         if self.use_coords:
             input_tensor=torch.cat([input_tensor, self.coords], axis=0)
-        return (
-                self.mask, 
-                input_tensor, 
-                torch.tensor(target_frame, dtype=torch.float32)
-                )
+        if self.norm_mean is not None:
+            m = self.norm_mean[:, None, None]
+            s = self.norm_std[:, None, None].clamp_min(1e-6)
+            input_tensor[:3] = (input_tensor[:3] - m) / s
+            target_tensor = (target_tensor - m) / s
+
+        return (self.mask, input_tensor, target_tensor)
         
     def get_trajectory(self, seq_idx):
         # returns full trajectory
@@ -119,17 +125,30 @@ val_files = [datafolder / f for f in [
     'uvp_grid_Re150.npy', 'uvp_grid_Re250.npy', 'uvp_grid_Re350.npy'
 ]]
 
-dt = 20 # only sample every dt timesteps
+def _compute_uvp_stats(files, timesample=1):
+    ms, vs = [], []
+    for f in files:
+        x = np.load(f)[::timesample].astype(np.float32)  # (T,3,H,W)
+        ms.append(x.mean(axis=(0, 2, 3)))
+        vs.append(x.var(axis=(0, 2, 3)))
+    mean = np.mean(ms, axis=0)
+    std = np.sqrt(np.mean(vs, axis=0))
+    std = np.maximum(std, 1e-6)
+    return mean, std
+
+
+dt = 10 # only sample every dt timesteps
+train_mean, train_std = _compute_uvp_stats([str(p) for p in train_files], timesample=dt)
 batch_size = 64
 use_coordinates=True
-train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates)
-val_dataset = FlowDataset(val_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+train_dataset = FlowDataset(train_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates, norm_mean=train_mean, norm_std=train_std)
+val_dataset = FlowDataset(val_files, flip_augmentation=False, timesample=dt, use_coords=use_coordinates, norm_mean=train_mean, norm_std=train_std)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,num_workers=4)
 
 
 class ELBO_Loss(torch.nn.Module):
-    def __init__(self, L):
+    def __init__(self, L,beta=1.0):
         """
         Helper class to compute the ELBO loss for the AR-LVM model
 
@@ -138,33 +157,22 @@ class ELBO_Loss(torch.nn.Module):
         """
         super(ELBO_Loss, self).__init__()
         self.L = L
-    
-    def forward(self, y_pred, y_true):
-        """
-        Forward pass of the ELBO loss.
+        self.beta = beta
 
-        Args:
-            y_pred: (q(z|h, x^t+1), p(z|h), p(x^t+1|z, h))
-                each is a torch.Distribution object
-            y_true: (x^t+1)
-
-        ELBO is the sum of the KL divergence between the approximate posterior and the prior
-        and the reconstruction loss
-        = KL(q(z|h, x^t+1) || p(z|h)) - E_q(z|h, x^t+1)[log p(x^t+1|z, h)]
-
-        Returns:
-            torch.Tensor: ELBO loss
-
-        """
+    def forward(self, y_pred, y_true, mask=None):
         enc_dist, prior_dist, predicted_frame = y_pred
-        
-        # KL divergence is calculated once per sequence
-        kl = torch.distributions.kl.kl_divergence(enc_dist, prior_dist).mean(0).sum()
-        
-        # Reconstruction loss is the MSE over the entire predicted sequence
-        recon = torch.nn.functional.mse_loss(predicted_frame, y_true, reduction='mean')
+        # Properly scaled KL (average over batch, channels, H, W)
+        kl = torch.distributions.kl.kl_divergence(enc_dist, prior_dist).mean()
+        # Masked reconstruction (exclude obstacle; mask==1 inside obstacle)
+        if mask is not None:
+            fluid = (1.0 - mask)  # (B,1,H,W)
+            diff2 = (predicted_frame - y_true).pow(2)  # (B,C,H,W)
+            # Broadcast fluid to channels
+            recon = (diff2 * fluid).sum() / (fluid.sum() * diff2.shape[1] + 1e-6)
+        else:
+            recon = torch.nn.functional.mse_loss(predicted_frame, y_true, reduction='mean')
 
-        return kl + recon
+        return self.beta * kl + recon
         
 
 class Encoder(torch.nn.Module):
@@ -391,7 +399,7 @@ class AR_LVM_Model(torch.nn.Module):
 
 
 class Trainer:
-    def __init__(self, model, train_loader, validation_loader, batch_size=1, lr=0.0001, epochs=100, loss_fn=torch.nn.MSELoss(), model_name= "02-LV-TB.pt"):
+    def __init__(self, model, train_loader, validation_loader, batch_size=1, lr=0.0001, epochs=100, loss_fn=torch.nn.MSELoss(), model_name= "02-LV-FBF.pt"):
         """
         Simple Trainer class to train a PyTorch (geometric) model on a dataset.
 
@@ -434,9 +442,7 @@ class Trainer:
                x_t = x_t.to(self.device)
                x_next = x_next.to(self.device)
                self.optimizer.zero_grad()
-               # FIX: Correct the argument order to match the model's forward method
                y_pred = self.model(x_t, x_next, mask)
-
                loss = self.loss_fn(y_pred, x_next)
                loss.backward()
                self.optimizer.step()
@@ -453,7 +459,7 @@ class Trainer:
                     x_t = x_t.to(self.device)
                     x_next = x_next.to(self.device)
                     out = self.model(x_t, x_next, mask)  # FIX: Correct the argument order
-                    loss = self.loss_fn(out, x_next)
+                    loss = self.loss_fn(out, x_next,mask)
                     mean_val_loss += loss.item()
                 mean_val_loss /= len(self.validation_loader)
 
@@ -474,7 +480,7 @@ lvm_cfd=AR_LVM_Model(
     use_coordinates=use_coordinates
 )
 loss=ELBO_Loss(L=20.0)
-p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader, batch_size=batch_size, lr=0.0001, epochs=100, loss_fn=loss, model_name="02-LV-FBF.pt")
+p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader, batch_size=batch_size, lr=0.0001, epochs=200, loss_fn=loss, model_name="02-LV-FBF-1.pt")
 p.train_loop()
 
 
