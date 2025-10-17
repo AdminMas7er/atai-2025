@@ -461,8 +461,8 @@ lvm_cfd=AR_LVM_Model(
     prior=Prior(num_layers=3, emb_dim=128, latent_dim=32, nonlinearity=torch.nn.functional.relu),
     use_coordinates=use_coordinates
 )
-loss=ELBO_Loss(L=20.0,beta=1.0)
-p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader, batch_size=batch_size, lr=0.0001, epochs=150, loss_fn=loss, model_name="02-LV-FBF-3.pt")
+loss=ELBO_Loss(L=20.0,beta=0.8)
+p = Trainer(model=lvm_cfd, train_loader=train_loader, validation_loader=val_loader, batch_size=batch_size, lr=0.0001, epochs=100, loss_fn=loss, model_name="02-LV-FBF-3.pt")
 p.train_loop()
 
 
